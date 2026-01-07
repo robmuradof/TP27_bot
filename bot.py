@@ -1,22 +1,23 @@
 import os
 import json
-import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     CallbackQueryHandler,
+    ContextTypes,
     ConversationHandler,
     MessageHandler,
-    ContextTypes,
     filters,
 )
 from telegram.error import BadRequest
 import gspread
 from google.oauth2.service_account import Credentials
+from flask import Flask, request
+import asyncio
 
 # ================= НАСТРОЙКИ =================
-BOT_TOKEN = "8439699322:AAEKg4f-uKu6Vvq4vfmmviI-OD0JbkD5TjM"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_PASSWORD = "1452"
 DATA_FILE = "partituras.json"
 
@@ -24,7 +25,9 @@ RASPI_SANIE_URL = "https://docs.google.com/spreadsheets/d/1FzS710QDmTO7HGoqWjk6B
 YANDEX_DISK_URL = "https://disk.yandex.ru/d/E5AOPqehJcxCGQ"
 X32_DISK_URL = "https://disk.yandex.ru/d/BQS3lXD8BFxIFw"
 
-SERVICE_ACCOUNT_EMAIL = "telegram-sheets-reader@telegram-sheets-bot-483114.iam.gserviceaccount.com"
+SERVICE_ACCOUNT_EMAIL = (
+    "telegram-sheets-reader@telegram-sheets-bot-483114.iam.gserviceaccount.com"
+)
 
 # ================= GOOGLE SHEETS =================
 SCOPE = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
@@ -42,36 +45,21 @@ def load_partituras():
         print("[DEBUG] JSON read error:", e)
         return {}
 
+def save_partituras(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
 partituras = load_partituras()
-_partituras_cache = partituras.copy()
-
-def save_partituras_if_changed():
-    global partituras, _partituras_cache
-    if partituras != _partituras_cache:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(partituras, f, ensure_ascii=False, indent=2)
-        _partituras_cache = partituras.copy()
-
-# ================= УТИЛИТЫ =================
-def make_keyboard(items, back_button=True, columns=2):
-    buttons = []
-    for i in range(0, len(items), columns):
-        row = []
-        for title, url in items[i:i + columns]:
-            row.append(InlineKeyboardButton(title, url=url))
-        buttons.append(row)
-    if back_button:
-        buttons.append([InlineKeyboardButton("⬅ [Назад]", callback_data="back")])
-    return InlineKeyboardMarkup(buttons)
 
 # ================= МЕНЮ =================
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("📅 Расписание", url=RASPI_SANIE_URL)],
         [InlineKeyboardButton("📁 Qlab проекты", url=YANDEX_DISK_URL)],
-        [InlineKeyboardButton("🎚 X32 сцены", url=X32_DISK_URL)],
-        [InlineKeyboardButton("🎼 Партитуры", callback_data="partituras")]
+        [InlineKeyboardButton("🎛 X32 сцены", url=X32_DISK_URL)],
+        [InlineKeyboardButton("🎼 Партитуры", callback_data="partituras")],
     ])
+
     try:
         if update.callback_query:
             await update.callback_query.edit_message_text(
@@ -87,28 +75,87 @@ async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await main_menu(update, context)
 
-# ================= ПАРТИТУРЫ =================
-async def handle_partituras(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ================= КНОПКИ =================
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if not partituras:
+    try:
+        await query.answer()
+    except BadRequest:
+        pass
+
+    data = query.data
+
+    if data == "partituras":
+        if not partituras:
+            try:
+                await query.edit_message_text(
+                    "Партитур пока нет.\nДобавьте через /addtab",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("⬅ [Назад]", callback_data="back")]]
+                    ),
+                )
+            except BadRequest:
+                pass
+            return
+
+        items = list(partituras.items())
+        buttons = []
+
+        for i in range(0, len(items), 2):
+            row = []
+            for title, url in items[i:i + 2]:
+                row.append(InlineKeyboardButton(title, url=url))
+            buttons.append(row)
+
+        buttons.append([InlineKeyboardButton("⬅ [Назад]", callback_data="back")])
+
         try:
             await query.edit_message_text(
-                "Партитур пока нет.\nДобавьте через /addtab",
-                reply_markup=InlineKeyboardMarkup(
-                    [[InlineKeyboardButton("⬅ [Назад]", callback_data="back")]]
-                ),
+                "🎼 Партитуры:",
+                reply_markup=InlineKeyboardMarkup(buttons),
             )
         except BadRequest:
             pass
         return
 
-    await query.edit_message_text(
-        "🎼 Партитуры:",
-        reply_markup=make_keyboard(list(partituras.items()), columns=2),
-    )
+    if data == "retry_add":
+        url = context.user_data.get("retry_url")
+        if not url:
+            return
 
-async def handle_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await main_menu(update, context)
+        try:
+            sheet = GS_CLIENT.open_by_url(url)
+            title = sheet.title
+            partituras[title] = url
+            save_partituras(partituras)
+            await query.edit_message_text(f"✅ Партитура «{title}» добавлена")
+        except Exception:
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 Попробовать снова", callback_data="retry_add")]
+            ])
+            await query.edit_message_text(
+                "❌ Не удалось открыть таблицу.\n"
+                "Проверьте ссылку и убедитесь, что сервисный аккаунт имеет доступ на чтение.\n"
+                "Чтобы разрешить доступ:\n"
+                "1️⃣ Откройте Google таблицу.\n"
+                "2️⃣ Нажмите 'Поделиться' → 'Добавить людей и группы'.\n"
+                "3️⃣ Введите email сервисного аккаунта:\n"
+                f"   {SERVICE_ACCOUNT_EMAIL}\n"
+                "4️⃣ Выберите доступ 'Чтение' и сохраните.\n"
+                "После этого нажмите кнопку ниже, чтобы попробовать снова:",
+                reply_markup=keyboard,
+            )
+        return
+
+    if data == "back":
+        await main_menu(update, context)
+
+    if data.startswith("del:"):
+        name = data.replace("del:", "")
+        if name in partituras:
+            del partituras[name]
+            save_partituras(partituras)
+            await query.edit_message_text(f"🗑 «{name}» удалена")
 
 # ================= ADDTAB =================
 ADD_PASSWORD, ADD_URL = range(2)
@@ -121,19 +168,19 @@ async def addtab_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text.strip() != ADMIN_PASSWORD:
         await update.message.reply_text("❌ Пароль неверный.")
         return ConversationHandler.END
-
-    await update.message.reply_text("Пароль верный. Отправьте ссылку на Google таблицу:")
+    await update.message.reply_text("Отправьте ссылку на Google таблицу:")
     return ADD_URL
 
 async def addtab_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
     context.user_data["retry_url"] = url
-
     try:
         sheet = GS_CLIENT.open_by_url(url)
         title = sheet.title
+        partituras[title] = url
+        save_partituras(partituras)
+        await update.message.reply_text(f"✅ Партитура «{title}» добавлена")
     except Exception:
-        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Попробовать снова", callback_data="retry_add")]
         ])
@@ -143,20 +190,12 @@ async def addtab_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Чтобы разрешить доступ:\n"
             "1️⃣ Откройте Google таблицу.\n"
             "2️⃣ Нажмите 'Поделиться' → 'Добавить людей и группы'.\n"
-            f"3️⃣ Введите email сервисного аккаунта:\n   {SERVICE_ACCOUNT_EMAIL}\n"
+            "3️⃣ Введите email сервисного аккаунта:\n"
+            f"   {SERVICE_ACCOUNT_EMAIL}\n"
             "4️⃣ Выберите доступ 'Чтение' и сохраните.\n"
             "После этого нажмите кнопку ниже, чтобы попробовать снова:",
             reply_markup=keyboard,
         )
-        return ConversationHandler.END
-
-    if title in partituras:
-        await update.message.reply_text("⚠ Такая таблица уже добавлена.")
-    else:
-        partituras[title] = url
-        save_partituras_if_changed()
-        await update.message.reply_text(f"✅ Партитура «{title}» добавлена")
-
     return ConversationHandler.END
 
 # ================= DELTAB =================
@@ -171,85 +210,23 @@ async def deltab_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Пароль неверный.")
         return ConversationHandler.END
 
-    if not partituras:
-        await update.message.reply_text("Список пуст.")
-        return ConversationHandler.END
-
     buttons = [
         [InlineKeyboardButton(name, callback_data=f"del:{name}")]
-        for name in partituras.keys()
+        for name in partituras
     ]
 
     await update.message.reply_text(
         "Выберите таблицу для удаления:",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        reply_markup=InlineKeyboardMarkup(buttons),
     )
     return ConversationHandler.END
 
-# ================= CALLBACK =================
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    try:
-        await query.answer()
-    except BadRequest:
-        pass
-
-    data = query.data
-
-    # удаление
-    if data.startswith("del:"):
-        name = data.replace("del:", "")
-        if name in partituras:
-            del partituras[name]
-            save_partituras_if_changed()
-            try:
-                await query.edit_message_text(f"🗑 Партитура «{name}» удалена")
-            except BadRequest:
-                pass
-        return
-
-    # повторная попытка добавления
-    if data == "retry_add":
-        url = context.user_data.get("retry_url")
-        if not url:
-            await query.edit_message_text("❌ Ссылка потеряна. Используйте /addtab заново.")
-            return
-        try:
-            sheet = GS_CLIENT.open_by_url(url)
-            title = sheet.title
-            if title in partituras:
-                await query.edit_message_text("⚠ Такая таблица уже добавлена.")
-            else:
-                partituras[title] = url
-                save_partituras_if_changed()
-                await query.edit_message_text(f"✅ Партитура «{title}» добавлена")
-        except Exception:
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Попробовать снова", callback_data="retry_add")]
-            ])
-            await query.edit_message_text(
-                "❌ Не удалось открыть таблицу.\n"
-                "Проверьте ссылку и убедитесь, что сервисный аккаунт имеет доступ на чтение.\n",
-                reply_markup=keyboard,
-            )
-        return
-
-    handler = {
-        "partituras": handle_partituras,
-        "back": handle_back,
-    }.get(data)
-
-    if handler:
-        await handler(update, context)
-
-# ================= ЗАПУСК =================
+# ================= APP =================
 app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-# Меню
 app.add_handler(CommandHandler("start", start))
 app.add_handler(CallbackQueryHandler(button_handler))
 
-# Addtab
 app.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("addtab", addtab_start)],
@@ -261,7 +238,6 @@ app.add_handler(
     )
 )
 
-# Deltab
 app.add_handler(
     ConversationHandler(
         entry_points=[CommandHandler("deltab", deltab_start)],
@@ -272,11 +248,17 @@ app.add_handler(
     )
 )
 
-print("[DEBUG] Бот запущен")
+# ================= WEBHOOK =================
+flask_app = Flask(__name__)
 
-while True:
-    try:
-        app.run_polling()
-    except Exception as e:
-        print("[ERROR]", e)
-        time.sleep(10)
+@flask_app.route("/", methods=["POST"])
+def telegram_webhook():
+    update = Update.de_json(request.json, app.bot)
+    asyncio.run(app.process_update(update))
+    return "ok"
+
+async def setup_webhook():
+    webhook_url = os.getenv("WEBHOOK_URL")
+    await app.bot.set_webhook(webhook_url)
+
+asyncio.run(setup_webhook())
